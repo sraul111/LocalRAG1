@@ -1,0 +1,6 @@
+# Build configuration for the LocalRAG1 project on Windows.
+# - Uses MSVC toolchain found at the non-standard Path.
+# - Disables the hidden_lifetime_in_path lint that triggers noise from
+#   thiserror-generated code.
+[target.x86_64-pc-windows-msvc]
+linker = 'C:\\Program Files\\Microsoft Visual Studio\\18\\Professional\\SDK\\ScopeCppSDK\\vc15\\VC\\bin\\link.exe'

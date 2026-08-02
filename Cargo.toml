@@ -1,0 +1,67 @@
+[package]
+name = "sl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Cwd-scoped local search engine. Indexes the folder you launched it from."
+license = "MIT"
+
+# Set both a library and a binary under the name `sl`. The library exposes
+# the modules so integration tests under `tests/` can drive them too.
+[lib]
+name = "sl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sl"
+path = "src/main.rs"
+
+# A small, dependency-light CLI. Each crate picked for a specific job.
+[dependencies]
+# CLI parsing — simple, widely used, great error messages.
+clap = { version = "4.5", features = ["derive"] }
+
+# Filesystem + system info.
+#   walkdir: recursive directory traversal (sync; we drive it in batches).
+#   sysinfo: read mount points, drive letters, OS metadata.
+walkdir = "2.5"
+sysinfo = { version = "0.32", default-features = false }
+ignore  = "0.4"          # the same parser used by ripgrep / cargo for .gitignore
+notify  = "6.1"          # filesystem watcher (Phase A late step)
+
+# SQLite, bundled so we don't depend on the user having a specific version.
+#   `bundled` = statically link libsqlite3 — single binary, zero install.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CSV reader (we don't index CSVs by default but it's useful for one tool).
+csv = "1.3"
+
+# HTTP client for the optional Tier-3 LLM loop (Ollama / OpenAI-compatible).
+ureq = { version = "2.10", default-features = false, features = ["json", "tls"] }
+
+# Serde for (de)serializing config + LLM tool calls.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging — we keep it simple (stderr, env-filtered).
+log = "0.4"
+env_logger = "0.11"
+
+# Misc small things.
+thiserror = "2.0"         # ergonomic error types
+anyhow    = "1.0"         # for `main` and tests only
+once_cell = "1.20"        # for lazy statics (mostly config defaults)
+directories = "5.0"       # to find %LOCALAPPDATA% etc. (currently unused but logged)
+
+[dev-dependencies]
+# Test-only helpers.
+tempfile = "3.13"         # isolated tmp dirs for fixture corpora
+proptest = "1.5"          # property tests for query normalization & filters
+predicates = "3.1"        # nicer assertions in some places
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

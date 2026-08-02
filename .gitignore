@@ -5,6 +5,9 @@ Cargo.lock
 src-tauri/target/
 src-tauri/gen/
 
+# We do commit Cargo.lock for an application binary (not a library)
+!Cargo.lock
+
 # ---- Node / frontend (Tauri UI) ----
 node_modules/
 dist/

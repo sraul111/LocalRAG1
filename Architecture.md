@@ -16,17 +16,23 @@ hundreds of MB of memory, a Python sidecar process, and a bundled model —
 all to do something SQLite FTS5 with a trigram tokenizer handles in
 single-digit milliseconds.
 
-LocalRAG1 is the **v1-shaped 80%**: a small Rust process (single .exe,
-no Python, no vector DB, no sidecar) that nails keyword + filename
-retrieval on a Windows C: drive in <100ms for the common case, and
-falls back to an **optional LLM agent loop** only for the long tail of
-queries that genuinely require semantic reasoning.
+LocalRAG1 is the **v1-shaped 80%**: a small Rust binary (single .exe,
+no Python, no vector DB, no sidecar) that you launch with `sl` from
+any folder. It indexes **the current working directory** (and its
+tree), answers filename + keyword queries in <100ms, and falls back
+to an optional LLM agent loop only for the long tail of queries that
+genuinely require semantic reasoning.
 
 It also borrows one specific lesson from the agentic pattern: **a local
 LLM with filesystem access and a small tool surface is itself a
-retrieval system.** We keep that as a Tier 4 fallback, not a primary
+retrieval system.** We keep that as a Tier 3 fallback, not a primary
 path, because the cost model is wrong for shipping today but the design
 is too useful to abandon.
+
+**Scope model:** every `sl` command is cwd-scoped. The index lives at
+`<cwd>/.localrag1/`. `sl` running in two different folders has two
+independent indexes, two independent configs. No global "scan my C:
+drive" mode.
 
 ---
 
