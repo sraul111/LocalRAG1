@@ -1,0 +1,68 @@
+# ---- Rust / Tauri (Process 1: UI + core) ----
+/target/
+**/target/
+Cargo.lock
+src-tauri/target/
+src-tauri/gen/
+
+# ---- Node / frontend (Tauri UI) ----
+node_modules/
+dist/
+build/
+.vite/
+.svelte-kit/
+.turbo/
+
+# ---- Python (Process 2: AI sidecar) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# ---- Local data / models (never commit user data or large binaries) ----
+# ChromaDB persistent store
+chroma_data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# FastEmbed / ONNX / reranker model caches
+models/
+*.onnx
+.fastembed_cache/
+.cache/
+
+# App data / index output (crawled index, embeddings, logs)
+app-data/
+index-data/
+*.log
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+*.local
+
+# ---- Packaging output ----
+*.msi
+*.exe
+!installer/**/*.exe
