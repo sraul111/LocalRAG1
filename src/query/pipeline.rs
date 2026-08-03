@@ -31,6 +31,19 @@ pub enum TierResult {
 /// 3. Tier 2 — re-rank tier-1 hits by metadata.
 /// 4. Tier 3 — if `llm.enabled` and we force tier3, invoke the agent loop.
 pub fn run(db: &Database, cfg: &Config, q: &Query, force_tier3: bool) -> Result<TierResult> {
+    // If the caller explicitly asked for Tier 3, skip Tiers 0-2 entirely
+    // and go straight to the LLM agent loop. The flag is an *override*,
+    // not a fallback trigger.
+    if force_tier3 {
+        if !cfg.llm.enabled {
+            return Err(crate::error::Error::other(
+                "--tier 3 requires llm.enabled = true in config",
+            ));
+        }
+        let txt = crate::llm::run(db, q, &cfg.llm, &cfg.search)?;
+        return Ok(TierResult::Tier3(txt));
+    }
+
     let q0 = tier0::run(db.conn(), q, cfg.search.tier0_min_score)
         .map_err(crate::error::Error::Sqlite)?;
     if !q0.is_empty() {
@@ -53,11 +66,6 @@ pub fn run(db: &Database, cfg: &Config, q: &Query, force_tier3: bool) -> Result<
             return Ok(TierResult::Tier2(ranked));
         }
         return Ok(TierResult::Empty);
-    }
-
-    if force_tier3 && cfg.llm.enabled {
-        let txt = crate::llm::run(db, q, &cfg.llm, &cfg.search)?;
-        return Ok(TierResult::Tier3(txt));
     }
 
     Ok(TierResult::Empty)
@@ -148,5 +156,19 @@ mod tests {
         let q = Query::parse("qqqxxxxnothing");
         let r = run(&db, &cfg, &q, false).unwrap();
         assert_eq!(r, TierResult::Empty);
+    }
+
+    #[test]
+    fn force_tier3_with_llm_disabled_errors_clearly() {
+        // Regression: --tier 3 with llm.enabled=false must NOT silently
+        // fall back to Tier 0. That's a misconfiguration the user needs
+        // to see.
+        let db = Database::open_memory().unwrap();
+        seed(&db);
+        let mut cfg = Config::defaults();
+        cfg.llm.enabled = false;
+        let q = Query::parse("README.md");
+        let r = run(&db, &cfg, &q, true);
+        assert!(r.is_err(), "expected Err when --tier 3 is forced but llm is disabled; got {r:?}");
     }
 }

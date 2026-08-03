@@ -93,11 +93,13 @@ mod tests {
     }
 
     #[test]
-    fn tier3_override_without_db_change() {
+    fn tier3_override_with_llm_disabled_errors() {
         let (t, ctx, _db) = ctx_with_db();
         let _ = t;
-        // No LLM configured → tier3 path is skipped, but no panic.
+        // No LLM configured → --tier 3 surfaces a clear error rather
+        // than silently falling back to Tier 0. The user explicitly
+        // asked for the LLM; failing loud is the right call.
         let r = super::run(&ctx, "design", Some(3));
-        assert!(r.is_ok());
+        assert!(r.is_err());
     }
 }

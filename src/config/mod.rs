@@ -154,6 +154,30 @@ impl Config {
             ("llm", "endpoint") => {
                 self.llm.endpoint = value.to_string();
             }
+            ("search", "tier0_min_score") => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| Error::other("expected f32 for tier0_min_score"))?;
+                self.search.tier0_min_score = v;
+            }
+            ("search", "tier1_min_score") => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| Error::other("expected f32 for tier1_min_score"))?;
+                self.search.tier1_min_score = v;
+            }
+            ("search", "tier3_max_iterations") => {
+                let v: u32 = value
+                    .parse()
+                    .map_err(|_| Error::other("expected u32 for tier3_max_iterations"))?;
+                self.search.tier3_max_iterations = v;
+            }
+            ("search", "tier3_wall_clock_ms") => {
+                let v: u32 = value
+                    .parse()
+                    .map_err(|_| Error::other("expected u32 for tier3_wall_clock_ms"))?;
+                self.search.tier3_wall_clock_ms = v;
+            }
             ("llm", "provider") => {
                 self.llm.provider = crate::config::llm::Provider::new(value);
             }
@@ -236,6 +260,19 @@ mod tests {
         assert!(cfg.llm.enabled);
         assert_eq!(cfg.llm.model, "qwen2.5:7b");
         assert_eq!(cfg.index.max_file_size_mb, 42);
+    }
+
+    #[test]
+    fn set_search_keys_works() {
+        let mut cfg = Config::defaults();
+        cfg.set("search.tier3_wall_clock_ms", "60000").unwrap();
+        cfg.set("search.tier3_max_iterations", "12").unwrap();
+        cfg.set("search.tier0_min_score", "0.7").unwrap();
+        cfg.set("search.tier1_min_score", "0.4").unwrap();
+        assert_eq!(cfg.search.tier3_wall_clock_ms, 60000);
+        assert_eq!(cfg.search.tier3_max_iterations, 12);
+        assert!((cfg.search.tier0_min_score - 0.7).abs() < 1e-6);
+        assert!((cfg.search.tier1_min_score - 0.4).abs() < 1e-6);
     }
 
     #[test]
