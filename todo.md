@@ -121,113 +121,212 @@ to do in the same PR.
 
 ---
 
-## Auto-init on first search (lazy index bootstrap)
+## Index bootstrap on REPL startup (snapshot-diff, lazy cost)
 
-**Status:** Not started. Design only.
+**Status:** Not implemented. Design only.
 
-**Motivation.** Today the user has to run `sl init` then `sl index`
-explicitly before any search works. That's two steps of friction
-before they get an answer, and most users will skip it. Instead,
-the first search in a folder should *just work* — the index gets
-built behind it, the user sees progress, and they're never blocked
-waiting for a huge corpus.
+**Motivation.** Users shouldn't have to run `sl init` followed
+by `sl index` before any search works. Two steps of friction is
+too many — they'll skip it, then complain `sl` doesn't find
+their files. The right behavior: `sl` alone, in a folder, opens
+a REPL that's already useful and gets more useful as the index
+fills in.
 
-**Desired flow:**
+**Design principle (load-bearing invariant).** Indexing is an
+*optimization*, not a prerequisite. The search path should
+always take the cheapest route that can answer:
 
-```
-$ sl "design patterns"
-initializing…                 ← shown the moment we open / create the DB
-indexing…   3 / 1284 files    ← single-line, overwrites in place
-ready.                        ← index usable, search begins
-...top results...
-sl [C:\Repos\LocalRAG1] ctx="design patterns">   ← REPL prompt, ready for follow-up
-```
+1. Indexed data exists for the relevant files → answer from
+   the index (tier 0/1/2, <100 ms).
+2. Index is partial or stale → answer from what we have; only
+   escalate to tier 3 if what we have is *weak*.
+3. Index is empty or unavailable → fall back to tier 3 with
+   whatever folder context we *did* collect. The user gets an
+   answer instead of an "indexing, please wait" wall.
 
-**Tier behavior on first search in a folder with no index:**
+This invariant outlives every implementation detail in this
+section. If we ever ship a behavior that violates it (e.g.,
+"wait for full index before opening REPL"), we've regressed.
 
-- **Single-word query (tier-0 territory):** Run tier 0 against
-  the raw folder listing immediately — no index needed. Print
-  results. Begin indexing in the background so tier 1+ is ready
-  for the next query.
-- **Phrase / multi-word query (tier-1 territory):** Detect no
-  index exists. Show "initializing…", build the index, then run
-  tier 1.
-- **Corpus above the size threshold (see guard below):** Don't
-  block on a full index. Run tier 0 from a directory walk, then
-  fall straight to tier 3 with a partial folder snapshot as
-  context. Background indexer makes tier 1 available for the
-  *next* query.
-- **Index build fails (permission error, exclude list blow-up,
-  corrupt folder):** Don't surface the error as a wall. Bundle
-  the user's raw query plus whatever folder context we *did*
-  collect (cwd, file count, top-level layout, extension
-  histogram, recent mtimes) and hand it to the LLM as a
-  tier-3 fallback. The user gets a meaningful answer regardless
-  of index state.
+**Trigger: REPL startup, not first search.** The previous
+version of this section ("auto-init on first search") placed
+the indexing work on the first search path. That was wrong.
+Moving it to startup means:
 
-**Size guard — "don't block the user":**
+- The REPL prompt shows real stats on day one: `sl
+  [C:\Repos\LocalRAG1] indexed 8122/8124, pending 2>` instead
+  of pretending the corpus is empty until the first keystroke.
+- Tier 0 doesn't have to handle "is the index even up yet?" at
+  search time — it can assume the on-startup snapshot is the
+  freshest known state.
+- First search becomes pure read; cost is bounded and
+  predictable.
+- "Initialize" is no longer a thing the user types. The REPL
+  opens → the index exists at the freshness we could afford
+  → the user searches.
 
-- Configurable threshold, default ~500 MB / ~10k files. Editable
-  per-folder via `.localrag1.toml`.
-- Above threshold: tier 0 runs from a walk, weak results escalate
-  to tier 3 with a partial folder snapshot (cwd + tree depth ≤ 2
-  + extension histogram + recent mtimes). Tier 1 catches up in
-  the background for the next query.
-- Way-above threshold (configurable ceiling, default ~10 GB /
-  ~200k files): skip tier 1 for this session entirely. Route
-  everything through tier 0 + tier 3. Prevents surprise 30-minute
-  index jobs and OOM.
-- Hardcoded upper bound on top of the config value so a
-  misconfigured `max=∞` can't OOM the process.
+**Mechanism: diff against last snapshot, index only deltas.**
 
-**Progress UI:**
+Treat the FTS5 index as a **derived view** of the folder. On
+every REPL startup:
 
-- Single-line overwriting progress (`\r`), not a full TUI.
-  `initializing…` → `indexing… 412 / 8124 files (12 MB / 1.3 GB)`.
-- Spinner only during "initializing" (DB open + schema check).
-- Never block the REPL prompt on indexing — once tier 0 returns
-  even partial results, drop into REPL. Indexer keeps running.
+1. **Load previous snapshot** (if any) from
+   `<cwd>/.localrag1/`:
+   - `files` table rows: `(path, mtime, size, content_hash,
+     indexed_at)`.
+   - `pending` rows: paths that were queued but not committed
+     in the previous session.
+   - `stats`: `total_files`, `indexed_files`, `pending_count`,
+     `last_indexed_at`, `last_index_duration_ms`.
+2. **Walk the cwd tree.** Honor the exclude list (system paths
+   non-overridable in v1 — see Scope lock section). Emit one
+   event per file: `{ path, mtime, size, content_hash }`.
+   Hash is `blake3` over content, lazy-computed only for files
+   whose `mtime`+`size` differs from the snapshot row.
+3. **Reconcile.**
+   - File in walk ∩ snapshot, hash unchanged → skip.
+   - File in walk ∩ snapshot, hash changed → upsert (FTS5
+     `INSERT OR REPLACE`). One row.
+   - File in walk, not in snapshot → insert. One row.
+   - File in snapshot, not in walk → delete row (or mark
+     `deleted_at` — see open question 3 below).
+   - File in `pending` from previous session and not yet
+     committed → re-enqueue for indexing.
+4. **Write updated snapshot.** Persist the new
+   `stats` row so the next startup has a baseline.
 
-**REPL integration:**
+This is the React-DOM analogy in startup-time clothing: the
+"index" is just the diff between on-disk state and what we
+last believed. We don't try to keep two trees in sync via
+events; we reconcile on boundary (startup), then search reads.
 
-- This is the natural entry path to the REPL section above. The
-  first successful search sets `last_query` / `last_hits` /
-  `last_tier` and the REPL prompt appears.
-- Inside an existing REPL session the DB is already open, so
-  auto-init is a no-op.
+**Why not `notify` / inotify / file watcher.** We considered
+it. Rejected because:
 
-**Implementation notes:**
+- A background watcher adds shutdown complexity (kill the
+  worker cleanly on REPL exit, on Ctrl+C, on terminal close).
+- Watcher reliability on Windows is uneven across network
+  shares, virtualized folders, and certain mounts — the
+  failure mode is *silent staleness*, which is worse than
+  paying ~50–200 ms of diff cost on next startup.
+- Auto-init and incremental indexing collapse into the same
+  code path under snapshot-diff. Two features, one mechanism.
+- The snapshot-diff approach handles abrupt shutdowns
+  naturally: worst case, one missed startup's worth of
+  deltas, recovered on next startup. A watcher that dies
+  silently leaves the index drifting forever.
 
-- Lazily open / create the DB inside the search handler, not in
-  CLI startup.
+**Size guard — "don't block the user."** Compare the walk's
+byte/file totals against the configured thresholds *before*
+running reconciliation:
+
+- **Small corpus (under threshold, default ~500 MB /
+  ~10 000 files):** Run reconcile synchronously. Show
+  progress as a single-line overwrite (`\r`) so the user
+  sees movement: `initializing…` → `indexing… 412 / 8124
+  files (12 MB / 1.3 GB)` → `ready. indexed 8122/8124,
+  pending 2`. Then open REPL. Repo-sized folders finish in
+  seconds; the progress line earns its keep.
+- **Large corpus (over threshold):** Run reconcile in a
+  background thread. Open REPL immediately with whatever
+  rows already exist (often thousands from a previous
+  session). Background thread emits stats to a status line
+  the REPL can render on next prompt. User searches against
+  partial index from the first keystroke; tier 1 results
+  improve visibly as the indexer catches up.
+- **Way-above ceiling (configurable, default ~10 GB /
+  ~200 000 files), user must opt in:** Skip tier 1 for this
+  session. Route everything through tier 0 + tier 3. The
+  hardcoded upper bound on top of the config value means
+  even `max=∞` can't OOM the process.
+
+**Progress UI (small-corpus path).**
+
+- Single-line overwrite, not a TUI. Avoid ncurses / crossterm
+  for v1 — text + `\r` is enough.
+- Spinner only during DB open + schema check ("initializing…").
+  Once we start the actual reconcile, show real progress.
+- After completion, print a one-line "ready" summary, then
+  drop into REPL.
+
+**REPL integration.**
+
+- REPL prompt shows real stats on every prompt: `sl
+  [C:\Repos\LocalRAG1] indexed 8122/8124, pending 2>`
+  (large-corpus path) or `sl [C:\Repos\LocalRAG1]
+  indexed 8124/8124>` (small-corpus path).
+- Inside the REPL, the snapshot-diff doesn't repeat. Per-search
+  cost is bounded to FTS5 query + a cheap cwd-`stat()` to
+  detect "folder changed since last known state" → if changed,
+  trigger a small diff (just the changed subtree) before
+  answering. This is the "auto-refresh on idle" we considered
+  — a tier-0-cost check that only escalates when the user's
+  prompt implies staleness.
+- On graceful REPL exit (`exit` / Ctrl+D): flush
+  `pending` → `files`, write final `stats`, close DB.
+  On abrupt exit (terminal close, Ctrl+C beyond first): any
+  rows already committed to SQLite (WAL = durable) survive;
+  any rows still in `pending` are re-queued on next startup.
+
+**Tier-3 fallback when index build fails.**
+
+Carried over from the previous version, unchanged in spirit:
+
+- If reconciliation fails (corrupt DB, exclude list blew up
+  the walk, permission error in cwd that we can't recover
+  from): don't surface the error as a wall.
+- Bundle the user's raw query plus whatever folder context
+  we *did* collect (cwd, file count, top-level layout,
+  extension histogram, recent mtimes) and hand it to the LLM
+  as a tier-3 fallback.
+- The user gets a meaningful answer regardless of index
+  state.
+
+This is also the fallback when the index exists but is
+stale / partial — see the Tier 1 → Tier 3 contract section
+for the escalation rule in the partial-index case.
+
+**Implementation notes.**
+
+- Index reconciliation runs in the CLI startup phase, before
+  rustyline takes the prompt. Synchronous in small-corpus
+  path; background thread in large-corpus path. Same code,
+  different executor.
 - The folder snapshot used as tier-3 fallback context is the
-  same metadata tier 2 already computes — no new pipeline, just
-  a new consumer of `Tier2Output`.
-- Background indexing = a thread (or `tokio::spawn`) owned by
-  the session, killed cleanly on REPL `exit`.
+  same metadata tier 2 already computes — no new pipeline,
+  just a new consumer of `Tier2Output`.
+- `stats` row is *the* UX surface for the REPL prompt and
+  for the `--status` CLI subcommand. Treat it as a public
+  contract.
 
-**Note on tier routing:** the word-vs-sentence distinction above
-is *not* how tiers actually route (per Architecture.md all four
-tiers can run on any query). The distinction that's *actually*
-useful: single-word queries can be served by tier 0 alone without
-waiting for the index, so auto-init is most aggressive there.
-Multi-word queries still get tier 0 first; the difference is only
-whether we wait for tier 1's FTS5 index to come up before
-declaring the search "ready". Tier routing itself is unchanged.
+**Note on tier routing.** The word-vs-sentence distinction
+in the previous version of this section is *not* how tiers
+actually route (per Architecture.md, all four tiers can run
+on any query). The distinction that's *actually* useful:
+single-word queries can be served by tier 0 alone without
+waiting for the FTS5 index, so the startup path is most
+aggressive about getting tier 0 rows quickly. Tier routing
+itself is unchanged.
 
 **Open questions:**
 
-1. `--no-auto-index` flag for users who want to wait for a full
-   index? Plan: yes, parity with the current explicit
-   `init` / `index` flow.
-2. Size guard: config, hardcoded, or both? Plan: both — config
-   knob plus a hardcoded ceiling to bound worst case.
-3. Tier-3 fallback without an index: gated behind
-   `llm.enabled = true` like the rest of tier 3, or always
-   available? Plan: gated by `llm.enabled` — if the user opted
-   out of LLM and the index isn't ready, return a clear
-   "index unavailable, run `sl index` manually" message after
-   tier 0 fails.
+1. `--no-auto-index` flag for users who want to wait for a
+   full index before REPL opens? Plan: yes, parity with the
+   current explicit `init` / `index` flow.
+2. Size guard: config, hardcoded, or both? Plan: both —
+   config knob plus a hardcoded ceiling to bound worst case.
+3. Delete policy: hard-delete missing rows, or soft-delete
+   with `deleted_at`? Plan: hard-delete for v1. If a user
+   renames a file and immediately searches, the diff catches
+   the new path on the next snapshot and re-adds it. The
+   "stale FTS5 row for the old path for one search cycle"
+   is acceptable; tier 0's filename match won't find it
+   anyway once the path's gone, and tier 1 will return 0
+   hits for an empty path.
+4. Large-corpus background thread lifecycle: who owns it?
+   Plan: a struct `IndexReconciler` owned by the REPL
+   session, exposing `pending() -> &Snapshot`, dropped on
+   REPL exit (which flushes pending rows first).
 
 ---
 
@@ -282,6 +381,44 @@ Two principles to lock in early so we don't drift:
   re-running searches. The agent loop is for the hard cases, not
   every query. This is the gating from the REPL motivation:
   don't burn 1–5s and ~1 GB RAM when FTS5 already nailed it.
+
+**Partial-index case (the indexing-in-progress state).**
+
+The "snapshot-diff on REPL startup" pattern means the index is
+*frequently* partial: a folder that's mid-reconcile after a
+large-corpus startup, a brand-new folder where only the most
+recent few files made it into the snapshot, a user who just
+added 50 files and the small-corpus path is still running
+when they search. The right escalation is **not** "forward
+everything to tier 3" — it's the same tier-3 rule as above,
+just with `index_coverage` as one more input signal:
+
+- **Run tier 1 against whatever rows are already in the
+  index.** Don't pre-emptively widen the search to "anything
+  tier 3 might find" — that just makes every search 1–5s
+  during indexing, which is the regression we're avoiding.
+- **Treat `index_coverage < full` exactly like weak tier-1
+  confidence** — it's one more reason tier 1's results may
+  be incomplete, not a license to skip tier 1.
+- **If the combined tier 1+2 evidence is weak**, escalate to
+  tier 3 with the partial-index context: the
+  `folder_snapshot` (cwd + tree + extension histogram +
+  recent mtimes) is what tier 3 uses to find files
+  tier 1 couldn't see yet. The user gets an answer; tier 3
+  fills the gaps; future searches benefit from the rows
+  landing in the index.
+- **If `index_coverage` is near full and tier 1 is still
+  weak**, that's an actual tier-1-confidence issue, not an
+  indexing issue. Handle the same as today's no-coverage
+  path.
+
+The plain reading of "data not indexed yet → tier 3" sounds
+helpful but produces a tool that's slower the more files it
+has. The right reading is **"search what we have; escalate
+only if what we have is weak."** Mechanically identical to
+the no-index case; the only difference is that tier 1 has
+*something* to search, and tier 3's prompt gets the
+`folder_snapshot` rather than starting blind.
 
 **Implementation pointer (when this gets built):**
 
@@ -382,6 +519,13 @@ Two real consequences of that incident:
   `mkdir`, `run`, `delete`. If a user asks tier 3 to "create"
   or "modify" something, tier 3 should respond with "this tool
   doesn't do that; use [the agentic sibling] for it."
+  **This invariant holds during indexing-in-progress too.**
+  The partial-index path is more likely to lean on tier 3
+  (because tier 1 is weaker when the index is incomplete),
+  which is exactly the moment a sloppy implementation would
+  start to "helpfully" widen tier 3's toolset to compensate.
+  Don't. The toolset is decided by safety, not by how often
+  tier 3 fires.
 - The `llm.enabled = false` invariant from the REPL section
   still holds: a user with no LLM configured gets a fully
   usable search + REPL tool. Tier 3's `Clarify` shape (asking
