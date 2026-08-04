@@ -230,3 +230,179 @@ declaring the search "ready". Tier routing itself is unchanged.
    tier 0 fails.
 
 ---
+
+## Tier 1 → Tier 3 contract (meaningful-answer policy)
+
+**Status:** Not implemented. To be implemented when tier 3 lands.
+
+**Motivation.** Tier 1 returns a *ranked list of files* — it
+doesn't know if those files actually answer the user's query or
+if the user typed a coherent phrase. That's fine: FTS5 is fast
+*because* it doesn't try to be smart. But it leaves a gap the
+user feels: tier 1 hands back 20 files for
+`"design patterns chubb project"` and the user has to eyeball
+which 2 are real. Tier 3 should close that gap — but only if it's
+clear about what tier 1 *can* and *cannot* tell it.
+
+**Decision: keep tier 1 dumb. Let tier 3 judge.**
+
+Two principles to lock in early so we don't drift:
+
+1. **Tier 1 returns evidence, not verdicts.** Output shape is
+   `Vec<{ path, matched_terms, phrase_match_score, snippet, bm25 }>`
+   — structured enough that tier 3 can see *which* terms
+   matched, *where* they matched, and *how strongly*. The LLM
+   needs the granularity; a flat "top 10 paths" loses the signal
+   that tells "this matched `"design"` because it's a substring
+   of `"designer"`" from "this matched because the file is
+   about design patterns."
+
+2. **Phrase coherence is a tier-3 judgment, not a tier-1
+   feature.** "Did the user type a real question or a bag of
+   words?" is a semantic question an LLM can answer and a
+   trigram tokenizer cannot. Tier 1 must not attempt it —
+   bolting semantics onto FTS5 defeats the speed premise and
+   produces a worse heuristic than the LLM anyway.
+
+**Tier 3 policy on top of tier-1 evidence:**
+
+- Given the query + tier 1's ranked evidence, tier 3 reasons:
+  *"do these matched files actually answer the user's question,
+  or is this a pile of files that happen to share those words?"*
+- **If yes:** synthesize a concise, file-grounded answer. Cite
+  the top 2–3 paths with one-line snippets. Don't dump all 20.
+- **If no (matched terms don't cohere, top hits are
+  substring-noise like `"design"` ⊂ `"designer"`, scores are
+  flat / ambiguous):** ask **one** clarifying question before
+  answering. Not a stream of them. Format:
+  `"by 'chubb project' do you mean [A] or [B]?"` — anchored
+  in evidence, not generic.
+- **If tier-1 confidence is high** (clear phrase match, strong
+  BM25, top hits agree): tier 3 should answer *without*
+  re-running searches. The agent loop is for the hard cases, not
+  every query. This is the gating from the REPL motivation:
+  don't burn 1–5s and ~1 GB RAM when FTS5 already nailed it.
+
+**Implementation pointer (when this gets built):**
+
+- This is a tier-3 prompt-template and tool-design decision, not
+  a tier-1 change. The prompt should receive:
+  - `query: String`
+  - `tier1_evidence: Vec<Evidence>` (the structured shape above)
+  - `tier2_metadata: Tier2Output` (extension / path / temporal
+    hints from the existing tier 2)
+  - `folder_snapshot: Option<FolderSnapshot>` (from the
+    auto-init section, when index isn't ready)
+- Tool definitions: keep tier 3's toolset as scoped as today
+  (`search`, `grep`, `read`, `list_dir`, `done`). Do **not** add
+  a "judge phrase coherence" tool — the LLM already judges that
+  inline given the evidence.
+- "Ask one clarifying question" is a *response shape*, not a
+  distinct tool. Tier 3 emits a `Clarify` payload with one
+  question; the REPL formats it and re-prompts.
+
+**Why capture this now (and not when we build tier 3):**
+
+- The tier-1 evidence schema gets locked in early so tier 3
+  doesn't have to retrofit. If we ship tier 1 first with a
+  flat `Vec<Path>` return type, tier 3 will have to re-query
+  tier 1 to recover the matched-terms info — wasteful and
+  silently loses signal.
+- The "keep tier 1 dumb" rule prevents a future contributor
+  from adding phrase-coherence heuristics to tier 1 "to help
+  tier 3 out." Document it now, find it later.
+
+---
+
+## Scope lock — search/analysis only, no write capability
+
+**Status:** Decision recorded. Not implemented (because it's the
+absence of a feature, but worth pinning down).
+
+**Decision.** `localrag1` (`sl`) is a **fast search and file
+analysis tool.** It does not write, edit, or execute files. Tier 3,
+when enabled, *reads* and *narrates* — it does not mutate.
+"Create me a Python project that does X" is **out of scope** for
+this binary.
+
+A separate Pi-style agentic tool — Rust, four basic tools
+(`read`, `write`, `edit`, `bash`), its own design discussion —
+will exist as its own project. That tool can consume
+`localrag1`'s FTS5 results over IPC or as a library to get the
+retrieval benefits without inheriting this binary's safety
+constraints.
+
+**Why we made this call (the Windows incident).**
+
+While exploring `sl` on `C:\` we hit access-denied errors when
+the indexer touched protected paths. This is exactly the failure
+mode that argues *against* mixing read-tool and write-tool in
+one binary: if this tool had `write_file` / `edit_file`
+capabilities and tier 3 (or a future action tier) had been
+allowed to mutate a file it found via tier-0 substring match —
+e.g. a config under `C:\Program Files` or a system DLL whose
+filename happened to share terms with the user's query — the
+user could lose the system with one ambiguous search.
+
+Keep the read-only invariant tight in this project. Move write
+capability to a sibling project that has its own permission
+model and its own audit trail.
+
+**Concrete safety constraints this implies:**
+
+- Indexer never writes outside `<cwd>/.localrag1/`. Period. If
+  the index can't be created there, it errors — it does **not**
+  fall back to `%LOCALAPPDATA%` or `%TEMP%` silently.
+- The default exclude list adds the Windows system paths that
+  produced access-denied noise (`C:\Windows`,
+  `C:\Program Files`, `C:\Program Files (x86)`,
+  `C:\ProgramData`, `C:\System Volume Information`). These
+  should be **non-overridable** in v1 — a user who really
+  wants to index them can flip a "I take responsibility"
+  config flag, but the safe default is unreachable.
+- Tier 3's toolset stays read-only: `search`, `grep`, `read`,
+  `list_dir`, `done`. **No** `write_file`, `edit_file`,
+  `mkdir`, `run`, `delete`. If a user asks tier 3 to "create"
+  or "modify" something, tier 3 should respond with "this tool
+  doesn't do that; use [the agentic sibling] for it."
+- The `llm.enabled = false` invariant from the REPL section
+  still holds: a user with no LLM configured gets a fully
+  usable search + REPL tool. Tier 3's `Clarify` shape (asking
+  a question) is allowed without write capabilities.
+
+**Forward pointer — "agentic shell with FTS5-for-token-economy"
+framing.**
+
+The reason FTS5 is worth the engineering in `localrag1` is
+*not* just that it's faster than embeddings. It's that an agent
+operating on a large local corpus can spend the bulk of each
+turn *re-deriving context* (re-reading, re-grepping, re-listing)
+unless the retrieval layer hands back **structured evidence**
+(see the tier-1 → tier-3 contract section above). An agent that
+calls into FTS5 first and gets back ranked, evidence-shaped
+results uses a small fraction of the tokens per turn compared
+to one that scans the filesystem raw.
+
+So even though we're not building the agentic shell in this
+project, the FTS5 + structured-evidence design in this project
+is **deliberately consumable** by a future agentic tool that
+needs to read lots of files cheaply. Treat the tier-1 schema
+as a public contract, not an internal detail — it's the
+handshake between "fast retrieval" (this project) and "bounded
+agency" (the future sibling project).
+
+**What this rule does *not* mean:**
+
+- It does not mean tier 3 can never narrate *how* to do
+  something. "To create that Python project, run
+  `mkdir foo && cd foo && python -m venv .venv`..." is a
+  narration, not an execution. Fine.
+- It does not mean no caching writes. Tier 1/2 indexes,
+  per-user project affinity prefs, last-query context — those
+  are local writes to `.localrag1/` and are clearly in scope.
+- It does not mean tier 3 cannot *suggest* code. Suggesting
+  "here's what the file should contain" is narration. The line
+  is whether the tool **executes** the change, not whether it
+  **proposes** it.
+
+---
