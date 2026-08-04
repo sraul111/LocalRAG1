@@ -332,21 +332,38 @@ will exist as its own project. That tool can consume
 retrieval benefits without inheriting this binary's safety
 constraints.
 
-**Why we made this call (the Windows incident).**
+**Why we made this call (the indexing walk + the Windows
+incident).**
 
-While exploring `sl` on `C:\` we hit access-denied errors when
-the indexer touched protected paths. This is exactly the failure
-mode that argues *against* mixing read-tool and write-tool in
-one binary: if this tool had `write_file` / `edit_file`
-capabilities and tier 3 (or a future action tier) had been
-allowed to mutate a file it found via tier-0 substring match —
-e.g. a config under `C:\Program Files` or a system DLL whose
-filename happened to share terms with the user's query — the
-user could lose the system with one ambiguous search.
+While exploring `sl` on `C:\`, the startup directory walk
+tried to stat / read protected system paths (`C:\Windows`,
+`C:\Program Files`, etc.) and surfaced `ACCESS_DENIED` errors
+into the user-visible output. **The indexer was not yet
+honoring a system-path exclude list, and tier 3 was not
+involved at all** — tier 3 is still unconfigured on this
+machine and would have returned its own failure, not an
+access-denied error.
 
-Keep the read-only invariant tight in this project. Move write
-capability to a sibling project that has its own permission
-model and its own audit trail.
+Two real consequences of that incident:
+
+1. **The exclude list must work, silently, by default.**
+   System paths must be filtered before stat, not after — so
+   the user never sees `ACCESS_DENIED` lines for paths they
+   didn't ask about. In v1 these are *non-overridable* in
+   the default config; a user who really needs to index them
+   can flip an explicit "I take responsibility" flag.
+2. **The argument for keeping write capability out of this
+   binary is real but hypothetical here, not from incident.**
+   The Windows walk hit read errors, not write errors — we
+   don't have an observed case of tier-0 substring-match
+   having put a tool on the path to trashing a system file.
+   The argument is preventive, not forensic: adding
+   `write_file` / `edit_file` to a tool that already
+   substring-matches filenames against system DLLs would
+   create the failure mode, not have exploited it. Move write
+   capability to a sibling project that has its own
+   permission model and its own audit trail — don't bolt it
+   onto this binary.
 
 **Concrete safety constraints this implies:**
 
