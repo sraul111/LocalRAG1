@@ -1126,180 +1126,251 @@ envelope and let the model weight them. Tier 2 unchanged.
 
 ---
 
-## Tier-3 system-prompt caching (round 1 scope)
+## Tier-3 metadata envelope (request-shaped properties)
 
-**Status:** Round 1. **Discussion required** on provider-level
-caching differences; round 2 captured in `todoRound2.md`.
+**Status:** Not implemented. Direction settled (per user
+input). Capture the envelope shape here so we don't drift
+across REPL/CLI/empty-escalation callers.
 
-**Scope of this section.** This is the *round 1* slice of what
-was previously a larger "metadata envelope" design. The full
-envelope (evidence bundle, session context, folder snapshot,
-tools, response contract, all per-bucket) is **round 2** — see
-`todoRound2.md` § "Tier 3 — full metadata envelope (deferred
-from round 1)".
+**Motivation.** Every tier-3 call — whether triggered by
+the REPL continuation rule, by empty-result escalation,
+or by an explicit `--tier 3` flag — should send the same
+*envelope* of request-shaped properties. The LLM needs
+the same context regardless of how it got called. We use
+a document-block style inspired by Anthropic's
+`add_user_message` API (per user screenshot reference)
+because:
 
-What round 1 actually builds: **cache the system prompt block
-per session, with provider-appropriate cache markers.** Nothing
-else in the envelope.
+1. It cleanly separates "the request" (envelope) from
+   "the conversation history" (message array).
+2. It allows structured fields (`type`, `media_type`,
+   `data`) that translate to provider-specific shapes:
+   - Anthropic: native `documents[]` blocks
+     with `citations.enabled`.
+   - Ollama / OpenAI: serialized as a JSON object in
+     the user message's `content` field.
+   - Gemini: serialized into a synthetic `parts[]`
+     entry alongside the actual prompt.
+3. It supports attaching file-level metadata and
+   request-level metadata (token economy knobs) in the
+   same shape.
 
-**Motivation.** The system prompt sent to tier 3 has a stable
-core that doesn't change turn-to-turn:
+### Envelope shape (canonical)
 
-- Tool definitions (compile-time constants)
-- Response contract (compile-time constants)
-- Citation enforcement rules
-- Read-only safety rules
-- Workspace context (cwd, supported extensions)
-
-Every turn the user makes, we're re-sending ~500-1500 tokens
-of this verbatim. That's wasted input tokens — and on hosted
-providers, input tokens are billed at the *highest* rate:
-
-- **Anthropic**: cached input tokens are ~10× cheaper than
-  fresh ones. The provider's server-side cache dedupes via
-  `cache_control` markers.
-- **OpenAI**: prefix caching is automatic when you use a
-  stable `prompt_cache_key`. ~10-min TTL default.
-- **Gemini**: explicit `cachedContent` resource; you
-  `create` it, you reference by name.
-- **Ollama**: no native cache, but the cost is zero
-  locally; the latency win is ~50-200 ms shaved per call
-  from not re-stringifying the prompt.
-
-This is the one caching win that pays back on day one.
-
-**Scope lock — what round 1 does NOT include:**
-
-- Caching the **conversation history** — append-only, every
-  new turn invalidates it. Common prompt-caching mistake;
-  skip explicitly.
-- Caching **per-query tier 1/2 evidence** — refreshed per
-  query, lives inside the user message. Belongs in round 2's
-  full envelope.
-- A general "prompt cache" abstraction. Just one block: the
-  system prompt. Keep the surface tiny.
-- Gemini/GPT-class cache invalidation strategies. Round 1
-  uses each provider's simplest cache marker; round 2
-  evaluates hit rates and tunes.
-
-**Session-scoped cache lifetime.**
-
-The cache key is **per session.** Reasons:
-
-- Users tend to ask the same or similar question multiple
-  times in a long session — the system prompt being cached
-  means the *second* turn has the system prompt's tokens
-  already in the provider's cache.
-- A long session might span many turns; the cache key
-  stays stable the whole time, so Anthropic's `cache_control`
-  block is reused as long as TTL holds.
-- When the session ends (REPL exit, `exit` command, Ctrl-D),
-  the cache key is dropped from our state. The provider's
-  server-side cache will TTL out on its own schedule (we
-  don't try to invalidate it explicitly in round 1).
-- One-shot CLI invocations have a fresh cache key on every
-  call. That's fine — single-shot tier-3 still gets the
-  cost benefit of one cached system prompt per process.
-
-**Rebuild-trigger rules.** The cached system prompt
-rebuilds (and the cache key regenerates) when:
-
-1. Session starts (REPL open, or one-shot CLI invocation).
-2. The user changes any field that affects system-prompt
-   content (`llm.enabled` flip, exclude list change,
-   tool definitions change). Round 1 detects via a
-   lightweight content hash; if the hash differs from
-   the cached version, rebuild.
-3. Round 1 does NOT attempt cross-session cache reuse.
-   Each session is independent.
-
-**Per-provider marker translation.**
-
-The system prompt is sent as a single block with a
-provider-appropriate cache marker:
-
-| Provider | Cache marker | Notes |
-|---|---|---|
-| Anthropic | `{type: "text", text: "...", cache_control: {type: "ephemeral"}}` | Marker on the system message block. |
-| OpenAI | `prompt_cache_key` field on the request body | Provider auto-dedupes prefix. |
-| Ollama | (none) | Just rebuild the string once per session and reuse; locally there's no API cost. |
-| Gemini | `cachedContent` resource created on first use, referenced by name on subsequent calls | Round 1 uses a `cachedContent` named after the SHA of the system prompt content. |
-
-No `if provider == "x"` branching in caller code — the
-adapter takes a `CachablePromptBlock` enum and emits the
-right marker for its provider. If a provider doesn't
-support caching, the adapter omits the marker and the
-block still serializes correctly.
-
-**Internal data shape (round 1).**
+Every tier-3 call sends this envelope, in addition to the
+prior-message array:
 
 ```rust
-/// One block of the prompt that's stable enough to cache.
-pub struct CachablePromptBlock {
-    pub content_hash: String,    // blake3 of content, used as cache key
-    pub content: String,         // the actual prompt text
+/// Single canonical envelope for every tier-3 call.
+pub struct LlmRequestEnvelope {
+    /// The user's actual question this turn.
+    pub query: String,
+
+    /// Tier 1/2 evidence — the structured output the model
+    /// acts on. Empty when tier 1/2 returned empty.
+    pub evidence: Vec<Tier1Evidence>,
+
+    /// Session context (engagement flag, prior citations,
+    /// inactivity counter). None for one-shot CLI calls.
+    pub session: Option<SessionContext>,
+
+    /// Folder snapshot — what tier 3 sees when evidence is
+    /// empty. Built once at REPL startup, refreshed on
+    /// snapshot-diff reconciliation.
+    pub folder_snapshot: FolderSnapshot,
+
+    /// Token-economy knobs. Same source for every adapter.
+    pub request_options: RequestOptions,
+
+    /// Tooling definitions the model can call.
+    pub tools: Vec<ToolDefinition>,
+
+    /// Response-shape contract — the JSON the model must
+    /// emit on its final turn.
+    pub response_contract: ResponseContract,
 }
 ```
 
-The session owns one of these. On every turn, the prompt
-builder asks "is the current system prompt content the
-same as last time?" — if yes, reuse; if no, rebuild and
-update the content hash.
+### Provider-specific translation
 
-**Tests to add (round 1 only):**
+The adapter layer converts this envelope per provider:
 
-1. *System prompt is built once per session.* Stub the
-   prompt builder; call it twice in a session; assert the
-   builder was called only once.
-2. *System prompt rebuilds on content change.* Stub the
-   builder; mutate a config field between calls; assert
-   the builder was called twice.
-3. *Cache marker is on the system block only, not the
-   user message.* Build a multi-turn body; assert the
-   system block has the marker, the user/assistant
-   blocks don't.
-4. *Anthropic adapter emits `cache_control`.*
-   Construct `CachablePromptBlock`; assert Anthropic
-   adapter produces a body with
-   `messages[0].cache_control == {type: "ephemeral"}`.
-5. *OpenAI adapter emits `prompt_cache_key`.* Same;
-   assert top-level `prompt_cache_key` is present.
-6. *Gemini adapter creates then references.* Same;
-   assert first call has a `cachedContent.create`-shape
-   log line, second call references by name.
-7. *Ollama adapter omits cache marker, doesn't
-   double-build.* Same; assert no marker field; assert
-   the Rust-side `&str` is reused across calls.
+| Field | Anthropic | Ollama | OpenAI-compat | Gemini |
+|---|---|---|---|---|
+| `query` | last user message `content` | message array | message array | `contents[].parts[].text` |
+| `evidence` | `documents[]` block with `citations.enabled` (per user screenshot) | JSON object in `content` field | JSON object in `content` field | synthetic `parts[]` entry |
+| `session` | system message preamble | system message | system message | `systemInstruction` |
+| `folder_snapshot` | system message addition | system message addition | system message addition | `systemInstruction` addition |
+| `request_options` | top-level body fields | `options` object | top-level body fields | `generationConfig` |
+| `tools` | top-level `tools[]` block | `tools[]` block | `tools[]` block | `tools[]` (function declarations) |
+| `response_contract` | `tool_choice` + system rule | `format: "json"` | `response_format.json_schema` | `responseMimeType` |
 
-**Implementation order (round 1):**
+### Document-block style (user's example)
 
-1. Add `CachablePromptBlock` struct in `llm/prompt.rs`.
-2. Refactor `llm::client.rs` to accept a
-   `&CachablePromptBlock` instead of building the system
-   prompt per call.
-3. Plumb prompt-build caching into `SessionCtx` (one-shot
-   CLI creates a fresh ctx per invocation; REPL reuses).
-4. Per-adapter translation of the cache marker.
-5. Tests 1-7 above.
+User-supplied example shows the structure we mirror:
 
-**Why this is round 1 (and the rest is round 2):**
+```python
+add_user_message(
+    messages,
+    [
+        {
+            "type": "document",
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": article_text,
+            },
+            "title": "Earth Article",
+            "citations": { "enabled": True }
+        },
+        ...
+    ]
+)
+```
 
-- Round 1 is the smallest piece of caching that delivers
-  real cost savings. Anthropic specifically: input-token
-  cost drops by ~10× for cached blocks.
-- Round 2's full envelope adds a lot of new surface
-  (evidence bundle, citation blocks, session fields).
-  Capturing only the one stable block in round 1 keeps
-  the diff small enough that we can validate the
-  cost-realization story before committing to a wider
-  design.
-- Provider-level caching differences (Anthropic ephemeral,
-  OpenAI prefix, Gemini named resources, Ollama none) are
-  genuinely per-provider and need live testing with each
-  one. Round 1 uses the cheapest marker per provider; round
-  2 tunes based on hit-rate data from real sessions.
+The `type: document` + `source.type: text` + `media_type:
+text/plain` + `citations.enabled` shape translates cleanly
+to our envelope:
 
-**Next action:** resolve with the user whether we want a
-config knob to disable caching (`llm_prompt_caching =
-true` default). If yes, add it to `SearchConfig`. If no,
-hardcode-on is fine.
+```json
+{
+  "type": "evidence_bundle",
+  "source": {
+    "type": "tier1_results",
+    "media_type": "application/vnd.sl.evidence+json"
+  },
+  "data": {
+    "items": [
+      {
+        "path": "src/patterns/factory.rs",
+        "matched_terms": ["factory", "create"],
+        "phrase_score": 0.42,
+        "snippet": "...impl Factory for ...",
+        "bm25": -2.31
+      }
+    ]
+  },
+  "title": "Tier 1/2 evidence for: 'factory pattern'",
+  "citations": { "enabled": true }
+}
+```
+
+The `citations.enabled: true` flag is what tells the model
+*"ground every claim in one of these documents, or say you
+have no evidence."* This is the load-bearing instruction —
+without it, models will freely confabulate.
+
+### Property categories — what always travels in the
+envelope
+
+**Per-call (changes every turn):**
+
+- `query` — the user's actual question.
+- `evidence` — tier 1/2 results, refreshed every turn.
+- (REPL only) `session.prior_citations`,
+  `session.prior_queries`.
+
+**Per-session (changes per REPL run, never in one-shot CLI):**
+
+- `session.tier3_engaged` — true/false.
+- `session.context_window_remaining` (optional, for token
+  budget tracking).
+- `session.engaged_at_query` — what triggered engagement.
+
+**Per-startup (set once when REPL opens, refreshed on
+snapshot-diff):**
+
+- `folder_snapshot.cwd` — always present.
+- `folder_snapshot.indexed_files`,
+  `folder_snapshot.total_size_bytes`.
+- `folder_snapshot.extension_histogram` — top 10 exts +
+  counts.
+- `folder_snapshot.last_indexed_at_ms`.
+
+**Per-config (read from `LlmConfig` / `SearchConfig`):**
+
+- `request_options.max_output_tokens`.
+- `request_options.thinking_budget`.
+- `request_options.temperature`.
+- `request_options.timeout_ms`.
+
+**Per-binary (compile-time constants):**
+
+- `tools[]` — the read-only tool set
+  (`list_dir`, `read_file`, `grep_files`, `done`).
+- `response_contract` — the JSON shape the model must
+  return (`Action::Cite`, `Action::Clarify`, `Action::Done`).
+
+### Why document-block style over flat JSON
+
+Three reasons, in order of importance:
+
+1. **Citations round-trip cleanly.** Anthropic's
+   `citations.enabled = true` flag is the cleanest way to
+   get provider-native citation tracking. The flat-JSON
+   alternative forces every adapter to re-implement the
+   same instruction manually.
+2. **Provider-adapter boundary is clear.** The adapter
+   receives a structured envelope; each provider knows
+   exactly which field becomes which native block.
+3. **Debugging surface.** When the model does something
+   weird, we log the envelope once and reproduce offline.
+   Flat JSON with 12 fields inline is harder to read
+   than a block-style struct with namespaced source/data.
+
+### Tests to add when this is implemented
+
+1. *Envelope completeness.* Construct envelope, dump to
+   string, assert each property category is present.
+2. *Anthropic adapter maps documents.* Build envelope
+   with 2 evidence items; assert Anthropic adapter
+   produces a `messages[].content[].type == "document"`
+   block per item with `citations.enabled == true`.
+3. *Ollama adapter flattens into messages.* Same
+   envelope; assert Ollama adapter produces a single
+   `messages[]` entry with envelope serialized as the
+   `content` JSON string.
+4. *Gemini adapter parts.* Same envelope; assert Gemini
+   adapter splits envelope into `systemInstruction`
+   (session + folder_snapshot) and `contents[]` (query +
+   evidence as synthetic parts).
+5. *Token-economy options flow through.* Envelope with
+   `max_output_tokens: 200`; assert Ollama body has
+   `options.num_predict: 200`, OpenAI body has `max_tokens:
+   200`, Gemini body has `generationConfig.maxOutputTokens:
+   200`.
+6. *Citation-enforcement smoke.* Mock an LLM that ignores
+   the instruction; assert we still extract citation
+   refs from the model's prose reply (best-effort) so
+   the user sees *something*, even if the model didn't
+   follow the citations contract.
+
+### Implementation order
+
+1. Define `LlmRequestEnvelope`, `SessionContext`,
+   `FolderSnapshot`, `RequestOptions`, `Tier1Evidence`,
+   `ToolDefinition`, `ResponseContract` structs.
+2. Implement envelope-builder for one-shot CLI and one
+   for REPL continuation.
+3. Migrate existing `llm::run(...)` to accept envelope.
+4. Add per-adapter translators (Anthropic, Ollama,
+   OpenAI-compat, Gemini). Start with Ollama, then
+   OpenAI-compat (already has an adapter), then Gemini,
+   then Anthropic.
+5. Tests 1-6 above.
+
+**Why capture this now:**
+
+- `LlmRequestEnvelope` is the central contract between
+  trigger sources (REPL, CLI, empty-escalation) and
+  provider adapters. Locking the shape before tier 3
+  lands means adapters don't drift.
+- The document-block style is a deliberate choice over
+  flat JSON — once a provider's adapter assumes flat
+  JSON in v1, refactoring to block-style is a 4-week
+  headache.
+- The `citations.enabled` flag is a model-instruction
+  primitive that, once trained into the model via prompt
+  tuning, doesn't translate cleanly into a flat-JSON
+  alternative.
+
