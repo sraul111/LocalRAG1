@@ -699,3 +699,228 @@ list, output-cap default, thinking-budget default + override
 mechanism) before touching `LlmConfig`.
 
 ---
+
+## Tier 3 empty-result escalation policy (empty-result → clarify)
+
+**Status:** Not implemented. **More discussion required** on the
+phrase heuristic and the clarifying-question shape, but the
+overall direction is settled.
+
+**Motivation.** Today `pipeline::run` short-circuits at the
+first non-empty tier and falls through to `TierResult::Empty`
+when tier 0/1/2 all return nothing. Tier 3 is only reachable
+via the explicit `--tier 3` flag. So for a query like
+`"design patterns"` against a repo where the phrase is nowhere
+in any file body, the user gets the **"no results" wall** —
+no clarifying question, no escalation, no recovery. The fix is
+a cheap escalation rule: *when tiers 0-2 are empty and the
+query looks phrase-shaped, give tier 3 one shot at asking the
+user what they meant*.
+
+**Concrete user-visible behavior we want:**
+
+1. `sl search "design patterns"` → tier 0/1/2 return empty →
+   tier 3 fires → tier 3 sees no evidence and emits a
+   clarifying question → CLI/REPL prints it instead of the
+   "no results" wall.
+2. `sl search "qqqxxxxnothing"` (nonsense) → tier 0/1/2 empty →
+   tier 3 fires → tier 3 also sees no evidence, asks one
+   clarifying question. (Even nonsense gets the question —
+   cheaper than debating whether the query "deserves" tier 3.)
+3. `sl search "README"` → tier 0 short-circuits → tier 3
+   never asked. (No escalation needed when tier 0 nailed it.)
+4. `sl search "factory"` with `llm.enabled = false` → tier
+   0/1/2 empty → return `Empty` exactly as today. No silent
+   fallback to a tier the user hasn't opted into.
+5. `sl search "factory"` with `llm.enabled = true` but
+   `tier3_fallback_on_empty = false` → return `Empty`. The
+   user has the LLM but doesn't want fallback inference.
+6. `sl search "factory pattern implementation"` (multi-token,
+   phrase-shaped) → empty tier 0/1/2 → tier 3 fires → tier 3
+   has a real question to disambiguate (impl vs. notes vs.
+   discussion).
+
+**Pipeline change (`query/pipeline.rs`).**
+
+After the existing tier 0/1/2 logic, before returning
+`TierResult::Empty`, add an escalation block:
+
+```rust
+// After tier 0/1/2 all return empty:
+if cfg.llm.enabled
+   && cfg.search.tier3_fallback_on_empty
+   && looks_like_phrase(q)
+{
+    let txt = crate::llm::run(db, q, &cfg.llm, &cfg.search)?;
+    return Ok(TierResult::Tier3(txt));
+}
+Ok(TierResult::Empty)
+```
+
+**`looks_like_phrase(q)` — the heuristic. More discussion
+required.** A query is "phrase-shaped" if it has more than one
+whitespace-separated token AND doesn't look like a bare keyword
+dump. Working rules:
+
+- **Trivially phrase:** two or more tokens → trigger tier 3.
+- **Trivially keyword:** single token → don't trigger. (Tier
+  3 can't help with "show me `factory`" without knowing what
+  the user means by factory.)
+- **Edge cases needing more thought:**
+  - All pronoun-only (`"it"`, `"them"`, `"those"`) →
+     usually means REPL follow-up; in one-shot search mode
+     this is a typo and *should* trigger tier 3 because the
+     user clearly meant something contextual that's now lost.
+  - Stopword-heavy but multi-token (`"of the"` ) →
+     probably a typo or paste mistake; trigger tier 3.
+  - Single token with high token-entropy (looks like a
+     random string / hash) → don't trigger. Cheaper to
+     return "no results" than to burn a tier-3 call.
+
+**Config knobs to add** to `SearchConfig`:
+
+```rust
+/// When all tiers 0-2 return empty AND llm.enabled is true,
+/// escalate to tier 3 instead of returning Empty.
+#[serde(default = "default_true")]
+pub tier3_fallback_on_empty: bool,    // default: true
+
+/// Minimum whitespace-separated tokens for the empty-result
+/// escalation to fire. Below this we treat the query as a
+/// bare keyword and skip tier 3.
+#[serde(default = "default_tier3_phrase_min_tokens")]
+pub tier3_phrase_min_tokens: usize,   // default: 2
+```
+
+Defaults are intentional: `true` for the flag because the
+behavior we want is "tier 3 fires by default when configured";
+`2` for the token count because most real queries are multi-
+token and the bare-keyword case is the rare exception.
+
+**Tier 3's response shape on this path — `Clarify`
+payload.** Tier 3 needs to know that its job on this path is
+*to ask, not to invent*. New variant on the existing `LlmReply`
+enum (or its `Action` subenum, depending on how this lands):
+
+```rust
+pub enum Action {
+    Cite(Vec<Citation>),  // existing — narrative answer with citations
+    Clarify(ClarifyQuestion),
+    Done,
+}
+
+pub struct ClarifyQuestion {
+    pub question: String,
+    /// Optional short list of candidate framings, drawn from the
+    /// query text. Lets the user pick fast instead of retyping.
+    pub candidates: Vec<String>,
+}
+```
+
+Example emission for the `"design patterns"` case:
+
+```json
+{
+  "action": "clarify",
+  "question": "what about 'design patterns' do you want — implementations in this repo, notes/explanations of the patterns, or both?",
+  "candidates": ["implementations", "concept notes", "both"]
+}
+```
+
+CLI prints the question and (optionally) the candidates as
+numbered choices. REPL stores the candidates so the user can
+type `1` / `2` / `3` to pick instead of retyping the question.
+
+**Prompt-side changes (`llm/prompt.rs`).** Two additions to the
+system prompt for tier 3:
+
+1. *Evidence-first rule (already there).* "If you have evidence,
+   answer with `action: cite`. If you do not have evidence, do
+   NOT list files or invent — emit `action: clarify`."
+2. *Citation-then-clarify fallback.* "If after searching you
+   have evidence but it's weak (matched terms don't cohere,
+   top hits are substring-noise like `design` ⊂ `designer`),
+   prefer `clarify` over a low-confidence `cite`."
+3. *One question, max.* "Emit exactly one `clarify` question.
+   Do not chain. Do not pre-emptively list everything you
+   could ask about."
+
+These three lines turn a model that wants to "just answer"
+into one that surfaces its uncertainty to the user.
+
+**What this does NOT solve (capture so we don't promise it):**
+
+- The "find me the factory pattern in code that doesn't
+  mention `factory` anywhere" case. That's a separate
+  problem requiring either a pre-built concept index
+  (design pattern name ↔ structural code features), multiple
+  tier-3 queries with different framings, or the user
+  phrasing it as a question first. The clarifying question
+  surfaces option 3 to the user; it doesn't fix option 1 or 2.
+- Long-tail question types where tier 3 itself has nothing
+  useful to ask (e.g., the corpus literally has nothing on
+  the topic). In that case tier 3 should still emit a
+  `clarify` rather than fabricate — "I couldn't find anything
+  in this folder about X; is the folder the right scope, or
+  should I look elsewhere?" is a useful clarification, not a
+  fabricated answer.
+- Multi-folder search. v1 is cwd-scoped. Tier 3 escalation
+  honors the same scope rule.
+
+**Tests to add when this is implemented:**
+
+1. *Unit: `looks_like_phrase`.* Trigger for `"design
+   patterns"`, don't trigger for `"README"`, edge cases for
+   single high-entropy tokens and stopword sequences.
+2. *Unit: pipeline escalation.* Stub `llm::run` to return a
+   canned `Clarify` payload; assert `pipeline::run` returns
+   `TierResult::Tier3` instead of `Empty` when tiers 0-2 are
+   empty + `llm.enabled` + flag on + phrase-shaped.
+3. *Unit: pipeline no-escalation when llm disabled.* Same
+   setup with `llm.enabled = false`; assert `Empty`.
+4. *Unit: pipeline no-escalation when flag off.* Same
+   setup with `tier3_fallback_on_empty = false`; assert
+   `Empty`.
+5. *Unit: pipeline no-escalation on keyword.* `"factory"`
+   with no matches; even with llm+flag on, assert `Empty`.
+6. *Integration: CLI prints clarify.* `sl search "design
+   patterns"` against an empty corpus with a stubbed
+   LLM; assert stdout matches `"by 'design patterns' do you
+   mean"` or similar and does NOT match `"no results"`.
+
+**Implementation order once decisions are made:**
+
+1. Add `tier3_fallback_on_empty` and `tier3_phrase_min_tokens`
+   to `SearchConfig` with defaults.
+2. Add `looks_like_phrase` helper to `query::query` (alongside
+   `Query::parse`).
+3. Modify `pipeline::run` to add the escalation block.
+4. Add `Action::Clarify(ClarifyQuestion)` to the LLM reply
+   shape and a corresponding prompt instruction.
+5. Update CLI (`cli/cmd_search.rs`) to detect `TierResult::Tier3`
+   and check whether the wrapped string is actually a JSON
+   `clarify` payload — render the question instead of the raw
+   string.
+6. Tests 1-6 above.
+
+**Why capture this now (and not when we build tier 3):**
+
+- The pipeline change crosses two modules (`pipeline::run`
+  and `cli::cmd_search`) and the JSON reply schema. Doing
+  it after tier 3 lands means re-plumbing the schema and
+  re-testing everything; doing it now while tier 3 is still
+  stubbed-out means the change is small and the tests are
+  cheap.
+- The phrase heuristic is a UX decision the user should
+  agree to before code lands — heuristics on user input are
+  easy to get wrong and hard to walk back.
+- The `Clarify` payload shape is a public contract between
+  the LLM and the CLI/REPL rendering layer. It needs to be
+  locked in before any tier-3 prompt work starts, or we'll
+  retrofit twice.
+
+**Next action:** resolve the `looks_like_phrase` edge cases
+(pronoun-only, stopword-only, high-entropy single tokens)
+with the user, then implement steps 1-6 above.
+
+---
