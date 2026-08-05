@@ -924,3 +924,452 @@ into one that surfaces its uncertainty to the user.
 with the user, then implement steps 1-6 above.
 
 ---
+
+## Tier-3 engagement routing (session-aware: tier 3 stays engaged)
+
+**Status:** Not implemented. Direction settled. Three
+cross-cutting decisions captured below.
+
+**Motivation.** Once a session's first question escalates to
+tier 3 — either via empty-result escalation or an explicit
+`--tier 3` flag — every subsequent question in that session
+is *probably* also exploratory (the user is doing research,
+asking follow-ups, building context). It would be jarring
+for tier 3 to vanish on the second turn and silently fall
+back to "no results" for the third. Worse: in a REPL
+session, every turn pays the DB-open + prompt-build cost, so
+throwing tier 3 away per turn would waste setup work we
+already did.
+
+**Decision (locked).** Once tier 3 engages in a session,
+**all subsequent queries in that session route through tier
+3**. Tier 0 still short-circuits a clean win (if the user
+types an exact filename, no point engaging tier 3); tier 1
+and tier 2 always run before tier 3 fires, supplying
+evidence the model needs.
+
+### Three locked-in rules
+
+1. **Tier 3, once engaged, stays engaged for the rest of
+   the session.** No silent fallback to "skip tier 3 this
+   turn."
+2. **Tier 1 + tier 2 always run before tier 3 when
+   engaged.** Their evidence is what makes tier 3 cheap
+   *and* accurate. Skipping them is a false economy —
+   ~15 ms total, and tier 3 needs the structured `Evidence`
+   payload to act on.
+3. **Tier 3 reaches for its own tools (`grep_files`,
+   `read_file`, `list_dir`), never calls tier 1/2
+   directly.** No LLM-→-search recursion. The pipeline
+   feeds evidence in one direction: tier 1/2 → tier 3.
+   This preserves the "tier 1 dumb" rule already locked
+   into the Tier 1 → Tier 3 contract section.
+
+### Why adaptive (not always-direct-to-tier-3)
+
+A pure "skip tier 1/2 once tier 3 is engaged" rule sounds
+cheaper but isn't:
+
+- **Tier 1/2 evidence is the model's primary input.** A
+  tier-3 call with no `evidence` field has nothing to
+  ground on — it either invents or fires `grep_files`
+  over the whole tree, which is more expensive than one
+  BM25 query.
+- **Tier 0 short-circuit is a real win.** When the user
+  types an exact filename, the answer is one query.
+  Returning tier 3 there adds 1-3 s of LLM latency for
+  zero benefit. So tier 0 *does* short-circuit even when
+  tier 3 is engaged.
+- **Tier 2 re-ranking is session-cheap.** It runs against
+  in-memory SQLite rows; ~10 ms even for thousands of
+  hits. The user doesn't feel it.
+
+### The routing model
+
+```
+query + session_ctx
+   │
+   ▼
+Tier 0 (filename) ─── hit? yes → return, done
+   │ no
+   ▼
+Tier 1 (FTS5) + Tier 2 (rerank) ── always run when tier 3 engaged
+   │
+   ├── tier3_engaged? no → return tier 2 ranked result
+   │
+   └── tier3_engaged? yes
+            │
+            ▼
+        tier 3 with envelope(evidence, session, request_options)
+            │
+            ├── emit action: "cite"       → cited answer
+            ├── emit action: "clarify"    → clarifying question
+            └── emit action: "tool_call"  → grep/read/list
+```
+
+### Session lifecycle (locked)
+
+`tier3_engaged` is session-scoped. Decided lifecycle:
+
+- **Engaged** when: user runs an explicit `--tier 3`, OR
+  tier 1/2 returned empty + `tier3_fallback_on_empty` was
+  triggered + tier 3 produced a usable reply. (If tier 3
+  errors out before producing a reply, the engagement
+  doesn't latch.)
+- **Reset** at: end of REPL session (Ctrl-D, `exit`,
+  `/reset`), N turns of inactivity (configurable, max
+  hardcoded), explicit `/reset` command. More on each
+  below.
+- **Not propagated** across CLI invocations. A fresh
+  `sl search "..."` starts with `tier3_engaged = false`.
+  Only the in-memory REPL session carries engagement
+  state. (One-shot CLI users see the existing
+  empty-escalation behavior and nothing more.)
+
+**Config knobs** (new, in `SearchConfig`):
+
+```rust
+/// After N turns of inactivity in a REPL session where tier 3
+/// was engaged, automatically disengage. Configurable, but a
+/// hardcoded ceiling prevents unbounded sessions from holding
+/// tier 3 forever.
+#[serde(default = "default_inactivity_disengage_turns")]
+pub tier3_inactivity_disengage_turns: u32,    // default: 8
+
+/// Hardcoded ceiling for the inactivity disengage. Even if the
+/// user sets the config to a million turns, it caps here.
+pub const TIER3_INACTIVITY_DISENGAGE_MAX: u32 = 64;
+```
+
+Defaults: `8` turns of inactivity disengages tier 3.
+Hardcoded ceiling: `64`. Captures the "user walked away"
+case without making the timeout configurable into
+absurdity.
+
+**`/reset` command** (REPL-level, not global). In a REPL
+session:
+
+```
+sl [C:\Repos\LocalRAG1] ctx=last-query> /reset
+sl [C:\Repos\LocalRAG1]> _   (prompt reflects disengaged state)
+```
+
+`/reset` clears:
+
+- `tier3_engaged` → `false`
+- `last_query`, `last_hits`, `last_tier`
+- session-scoped `prior_queries`, `prior_citations`
+- the inactivity turn counter
+
+The DB connection stays open. `sl index` rows persist. Only
+the conversational / engagement state resets.
+
+**Reason for the inactivity timeout, not a wall-clock
+timeout.** A turn-based counter resets on every user input,
+so it's robust to "user typed a long message" or "user is
+reading." A wall-clock timer would misfire in either of
+those cases. Turn count matches how the user thinks about
+session flow.
+
+### Citation caching (decision)
+
+**Not required.** Tier 2 stays stateless. We will not
+boost "you cited this last turn" in tier 2's re-ranking.
+Reasoning: tier 2 staying stateless preserves the
+"cheap, deterministic" property that makes the pipeline
+fast. Session-aware ranking is a v2 concern if it turns
+out users want it.
+
+If a future user complains "I cited a file in turn 3 and
+turn 4 didn't find it again," the fix is in the prompt,
+not in tier 2: add `prior_citations` to the tier-3 prompt
+envelope and let the model weight them. Tier 2 unchanged.
+
+### Tests to add when this is implemented
+
+1. *Engagement latches on explicit `--tier 3`.*
+   `pipeline::run(force_tier3=true)` sets
+   `session.tier3_engaged = true` even if tier 1/2
+   returned non-empty.
+2. *Engagement latches on empty-escalation.* Stub tier 3
+   to return `Cite`; assert next query in same session
+   also routes through tier 3.
+3. *Engagement does NOT latch on tier 3 error.* Stub tier 3
+   to error; assert next query doesn't fire tier 3.
+4. *Tier 1/2 always run when engaged.* Stub tier 1 to
+   return 5 hits with one in evidence; assert tier 3 was
+   called with that evidence in the envelope.
+5. *Tier 0 short-circuit still wins over engagement.*
+   Tier 0 returns a hit; tier 3 not called.
+6. *`/reset` clears engagement.* After `/reset`, query
+   that would have escalated to tier 3 instead goes
+   through the original empty-result path.
+7. *Inactivity disengages after N turns.* Mock a session
+   with 9 turns of inactivity; assert tier 3 disengaged.
+8. *Inactivity ceiling honored.* Set config to 1000,
+   assert actual cap is `TIER3_INACTIVITY_DISENGAGE_MAX`.
+
+### Implementation order
+
+1. Add `SessionCtx` struct (engagement + prior queries +
+   prior citations + inactivity counter) — owned by REPL.
+2. Modify `pipeline::run` to take `&SessionCtx`, branch on
+   `tier3_engaged`.
+3. Implement `llm::run_with_evidence(...)` that takes the
+   ranked tier-1/2 results and includes them in the prompt
+   envelope.
+4. Add inactivity counter (turn-based) and `/reset`
+   handler in REPL.
+5. Engagement-latching in `pipeline::run` on successful
+   tier 3 reply.
+6. Tests 1-8 above.
+
+---
+
+## Tier-3 metadata envelope (request-shaped properties)
+
+**Status:** Not implemented. Direction settled (per user
+input). Capture the envelope shape here so we don't drift
+across REPL/CLI/empty-escalation callers.
+
+**Motivation.** Every tier-3 call — whether triggered by
+the REPL continuation rule, by empty-result escalation,
+or by an explicit `--tier 3` flag — should send the same
+*envelope* of request-shaped properties. The LLM needs
+the same context regardless of how it got called. We use
+a document-block style inspired by Anthropic's
+`add_user_message` API (per user screenshot reference)
+because:
+
+1. It cleanly separates "the request" (envelope) from
+   "the conversation history" (message array).
+2. It allows structured fields (`type`, `media_type`,
+   `data`) that translate to provider-specific shapes:
+   - Anthropic: native `documents[]` blocks
+     with `citations.enabled`.
+   - Ollama / OpenAI: serialized as a JSON object in
+     the user message's `content` field.
+   - Gemini: serialized into a synthetic `parts[]`
+     entry alongside the actual prompt.
+3. It supports attaching file-level metadata and
+   request-level metadata (token economy knobs) in the
+   same shape.
+
+### Envelope shape (canonical)
+
+Every tier-3 call sends this envelope, in addition to the
+prior-message array:
+
+```rust
+/// Single canonical envelope for every tier-3 call.
+pub struct LlmRequestEnvelope {
+    /// The user's actual question this turn.
+    pub query: String,
+
+    /// Tier 1/2 evidence — the structured output the model
+    /// acts on. Empty when tier 1/2 returned empty.
+    pub evidence: Vec<Tier1Evidence>,
+
+    /// Session context (engagement flag, prior citations,
+    /// inactivity counter). None for one-shot CLI calls.
+    pub session: Option<SessionContext>,
+
+    /// Folder snapshot — what tier 3 sees when evidence is
+    /// empty. Built once at REPL startup, refreshed on
+    /// snapshot-diff reconciliation.
+    pub folder_snapshot: FolderSnapshot,
+
+    /// Token-economy knobs. Same source for every adapter.
+    pub request_options: RequestOptions,
+
+    /// Tooling definitions the model can call.
+    pub tools: Vec<ToolDefinition>,
+
+    /// Response-shape contract — the JSON the model must
+    /// emit on its final turn.
+    pub response_contract: ResponseContract,
+}
+```
+
+### Provider-specific translation
+
+The adapter layer converts this envelope per provider:
+
+| Field | Anthropic | Ollama | OpenAI-compat | Gemini |
+|---|---|---|---|---|
+| `query` | last user message `content` | message array | message array | `contents[].parts[].text` |
+| `evidence` | `documents[]` block with `citations.enabled` (per user screenshot) | JSON object in `content` field | JSON object in `content` field | synthetic `parts[]` entry |
+| `session` | system message preamble | system message | system message | `systemInstruction` |
+| `folder_snapshot` | system message addition | system message addition | system message addition | `systemInstruction` addition |
+| `request_options` | top-level body fields | `options` object | top-level body fields | `generationConfig` |
+| `tools` | top-level `tools[]` block | `tools[]` block | `tools[]` block | `tools[]` (function declarations) |
+| `response_contract` | `tool_choice` + system rule | `format: "json"` | `response_format.json_schema` | `responseMimeType` |
+
+### Document-block style (user's example)
+
+User-supplied example shows the structure we mirror:
+
+```python
+add_user_message(
+    messages,
+    [
+        {
+            "type": "document",
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": article_text,
+            },
+            "title": "Earth Article",
+            "citations": { "enabled": True }
+        },
+        ...
+    ]
+)
+```
+
+The `type: document` + `source.type: text` + `media_type:
+text/plain` + `citations.enabled` shape translates cleanly
+to our envelope:
+
+```json
+{
+  "type": "evidence_bundle",
+  "source": {
+    "type": "tier1_results",
+    "media_type": "application/vnd.sl.evidence+json"
+  },
+  "data": {
+    "items": [
+      {
+        "path": "src/patterns/factory.rs",
+        "matched_terms": ["factory", "create"],
+        "phrase_score": 0.42,
+        "snippet": "...impl Factory for ...",
+        "bm25": -2.31
+      }
+    ]
+  },
+  "title": "Tier 1/2 evidence for: 'factory pattern'",
+  "citations": { "enabled": true }
+}
+```
+
+The `citations.enabled: true` flag is what tells the model
+*"ground every claim in one of these documents, or say you
+have no evidence."* This is the load-bearing instruction —
+without it, models will freely confabulate.
+
+### Property categories — what always travels in the
+envelope
+
+**Per-call (changes every turn):**
+
+- `query` — the user's actual question.
+- `evidence` — tier 1/2 results, refreshed every turn.
+- (REPL only) `session.prior_citations`,
+  `session.prior_queries`.
+
+**Per-session (changes per REPL run, never in one-shot CLI):**
+
+- `session.tier3_engaged` — true/false.
+- `session.context_window_remaining` (optional, for token
+  budget tracking).
+- `session.engaged_at_query` — what triggered engagement.
+
+**Per-startup (set once when REPL opens, refreshed on
+snapshot-diff):**
+
+- `folder_snapshot.cwd` — always present.
+- `folder_snapshot.indexed_files`,
+  `folder_snapshot.total_size_bytes`.
+- `folder_snapshot.extension_histogram` — top 10 exts +
+  counts.
+- `folder_snapshot.last_indexed_at_ms`.
+
+**Per-config (read from `LlmConfig` / `SearchConfig`):**
+
+- `request_options.max_output_tokens`.
+- `request_options.thinking_budget`.
+- `request_options.temperature`.
+- `request_options.timeout_ms`.
+
+**Per-binary (compile-time constants):**
+
+- `tools[]` — the read-only tool set
+  (`list_dir`, `read_file`, `grep_files`, `done`).
+- `response_contract` — the JSON shape the model must
+  return (`Action::Cite`, `Action::Clarify`, `Action::Done`).
+
+### Why document-block style over flat JSON
+
+Three reasons, in order of importance:
+
+1. **Citations round-trip cleanly.** Anthropic's
+   `citations.enabled = true` flag is the cleanest way to
+   get provider-native citation tracking. The flat-JSON
+   alternative forces every adapter to re-implement the
+   same instruction manually.
+2. **Provider-adapter boundary is clear.** The adapter
+   receives a structured envelope; each provider knows
+   exactly which field becomes which native block.
+3. **Debugging surface.** When the model does something
+   weird, we log the envelope once and reproduce offline.
+   Flat JSON with 12 fields inline is harder to read
+   than a block-style struct with namespaced source/data.
+
+### Tests to add when this is implemented
+
+1. *Envelope completeness.* Construct envelope, dump to
+   string, assert each property category is present.
+2. *Anthropic adapter maps documents.* Build envelope
+   with 2 evidence items; assert Anthropic adapter
+   produces a `messages[].content[].type == "document"`
+   block per item with `citations.enabled == true`.
+3. *Ollama adapter flattens into messages.* Same
+   envelope; assert Ollama adapter produces a single
+   `messages[]` entry with envelope serialized as the
+   `content` JSON string.
+4. *Gemini adapter parts.* Same envelope; assert Gemini
+   adapter splits envelope into `systemInstruction`
+   (session + folder_snapshot) and `contents[]` (query +
+   evidence as synthetic parts).
+5. *Token-economy options flow through.* Envelope with
+   `max_output_tokens: 200`; assert Ollama body has
+   `options.num_predict: 200`, OpenAI body has `max_tokens:
+   200`, Gemini body has `generationConfig.maxOutputTokens:
+   200`.
+6. *Citation-enforcement smoke.* Mock an LLM that ignores
+   the instruction; assert we still extract citation
+   refs from the model's prose reply (best-effort) so
+   the user sees *something*, even if the model didn't
+   follow the citations contract.
+
+### Implementation order
+
+1. Define `LlmRequestEnvelope`, `SessionContext`,
+   `FolderSnapshot`, `RequestOptions`, `Tier1Evidence`,
+   `ToolDefinition`, `ResponseContract` structs.
+2. Implement envelope-builder for one-shot CLI and one
+   for REPL continuation.
+3. Migrate existing `llm::run(...)` to accept envelope.
+4. Add per-adapter translators (Anthropic, Ollama,
+   OpenAI-compat, Gemini). Start with Ollama, then
+   OpenAI-compat (already has an adapter), then Gemini,
+   then Anthropic.
+5. Tests 1-6 above.
+
+**Why capture this now:**
+
+- `LlmRequestEnvelope` is the central contract between
+  trigger sources (REPL, CLI, empty-escalation) and
+  provider adapters. Locking the shape before tier 3
+  lands means adapters don't drift.
+- The document-block style is a deliberate choice over
+  flat JSON — once a provider's adapter assumes flat
+  JSON in v1, refactoring to block-style is a 4-week
+  headache.
+- The `citations.enabled` flag is a model-instruction
+  primitive that, once trained into the model via prompt
+  tuning, doesn't translate cleanly into a flat-JSON
+  alternative.
