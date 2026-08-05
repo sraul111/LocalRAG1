@@ -567,3 +567,135 @@ agency" (the future sibling project).
   **proposes** it.
 
 ---
+
+## Tier 3 token-economy knobs — provider-aware parameter mapping
+
+**Status:** Not started. **More discussion required** before
+implementation. We've sketched the shape but haven't pinned the
+defaults or the provider list. Resolve before writing code.
+
+**Motivation.** Tier 3 (LLM agent loop) is the only path in
+`sl` that costs money or RAM. Without per-call caps a single
+agent turn can return a multi-thousand-token monologue; without
+a cap on internal "thinking," reasoning-capable models
+(Qwen3, Gemini 2.5, Claude with extended thinking, OpenAI
+o1/o3) burn tokens before producing anything useful. Token
+economy is not a nice-to-have — it's the difference between
+"tier 3 is free" and "tier 3 is a liability."
+
+**The key insight: one config field, one wire format per
+provider.** The user writes one TOML block. Three adapter
+functions translate it into whatever the model on the other
+side actually accepts. No `if provider == "x"` branching
+outside the adapters.
+
+**Three knobs, all in `LlmConfig`:**
+
+| Field | What it caps | Default |
+|---|---|---|
+| `max_output_tokens` | final answer length | `300` |
+| `thinking_budget` | internal reasoning tokens (0 = off) | `0` |
+| `temperature` | randomness (0 = deterministic) | `0.0` |
+
+**Adapter translation matrix** (which JSON field each provider
+honors each knob in):
+
+| Concept | Ollama (`/api/chat`) | OpenAI-compat (`/chat/completions`) | Gemini REST |
+|---|---|---|---|
+| Output cap | `options.num_predict` | `max_tokens` | `generationConfig.maxOutputTokens` |
+| Disable thinking | omit, or `think: false` for qwen3+ | `reasoning_effort: "low"` or omit | `generationConfig.thinkingConfig.thinkingBudget: 0` |
+| Force JSON | `"format": "json"` | `response_format: {type: "json_object"}` | `generationConfig.responseMimeType: "application/json"` |
+| Temperature | `options.temperature` | `temperature` | `generationConfig.temperature` |
+| System prompt | a `{role:"system"}` message in the array | same | **separate** `systemInstruction.parts[].text` field |
+
+**Notable provider quirks (capture so we don't relearn them):**
+
+- **Gemini is the odd one out.** The system prompt isn't a
+  message in the array — it's a top-level `systemInstruction`
+  field with its own schema. Adapter must partition the
+  messages array before building the body.
+- **Ollama silently ignores unknown options** unless a
+  specific model says otherwise. Safer to emit and let the
+  model filter than to branch on model name.
+- **`thinking_budget` is only meaningful for reasoning-
+  capable models.** Anthropic, Gemini 2.5, OpenAI o-series,
+  Qwen3 honor it; everything else drops it silently. Don't
+  error on `thinking_budget > 0` for a non-reasoning model —
+  just let the provider ignore it. Log once at startup so
+  the user knows it didn't take effect.
+- **`max_output_tokens` of 0 is invalid on most providers.**
+  Clamp to ≥ 16 at the adapter boundary.
+
+**Unknowns — explicitly not resolved yet:**
+
+1. **Which providers does v1 actually need?** Confirmed:
+   Ollama (`minimax-m3:cloud` running locally for the user).
+   The user has Gemini access and may want Qwen. Do we ship
+   three adapters in v1, or just Ollama + a generic
+   `openai-compatible` shim that *happens* to talk to
+   Gemini's OpenAI-compatible endpoint?
+2. **If Gemini, do we use Gemini REST or Gemini's OpenAI-
+   compatible endpoint?** The OpenAI-compatible endpoint
+   hides the `systemInstruction` quirk but adds another
+   layer of "is this field mapped?" to debug.
+3. **What's the right `max_output_tokens` default for tier 3
+   specifically?** The agent returns filenames + one-line
+   explanations; an answer rarely exceeds 100 tokens. 300 is
+   safe but maybe 150 is better — saves ~50% on the typical
+   turn. **Need user input.**
+4. **`thinking_budget` default of 0 is conservative, but is
+   it too conservative?** For Ollama with `minimax-m3:cloud`
+   specifically, no — that model doesn't reason. For Qwen3
+   via Ollama, the user might *want* reasoning enabled
+   selectively. **Need user input on "off by default with
+   per-query override" vs. "config-driven, fixed at startup."**
+5. **Where does `temperature` live in the REPL?** Today it's
+   a startup-time config. Maybe it should be a per-query flag
+   (`sl search "..." --temp 0.0`)? **Out of scope for v1,
+   revisit after REPL ships.**
+6. **Per-call `max_tokens` vs. agent-loop caps.** Per-call
+   cap stops one reply from being a 10k-token monologue. The
+   existing agent-loop caps in `run_agent` (`tier3_max_iterations`,
+   `tier3_wall_clock_ms`) stop the *loop* from making 50 HTTP
+   calls. These are complementary, not redundant. Ship both.
+7. **Token-budget telemetry?** Should `sl search --tier 3`
+   print tokens-used at the end? Useful for the user to
+   calibrate their config. **Out of scope for v1, cheap to
+   add later.**
+
+**Proposed implementation order once decisions are made:**
+
+1. Add `max_output_tokens` / `thinking_budget` / `temperature`
+   to `LlmConfig` with defaults (after step 3 above).
+2. Add internal `RequestOptions` struct + `From<&LlmConfig>`
+   conversion in `llm/client.rs`.
+3. Refactor existing `chat_ollama` and `chat_openai_compat`
+   into body-builder functions + a thin `send_and_parse` shell.
+4. Add `chat_gemini` (genuinely different URL + system-prompt
+   handling) if step 1 says we need it.
+5. Fix the existing `unknown_provider_errors` test in
+   `client.rs` — it uses a struct literal that won't compile
+   after step 1.
+6. Add one `body_options_are_passed_through` test per
+   provider — assert `max_output_tokens: 300` produces
+   `"num_predict": 300` in the Ollama body, `"max_tokens": 300`
+   in the OpenAI body, `"maxOutputTokens": 300` in the Gemini
+   body, etc.
+
+**Why capture this now (and not when we build tier 3):**
+
+- The decision affects `LlmConfig`'s stable surface. Once
+  users write TOML against it, changing the field names or
+  defaults is a compat break.
+- The provider list is a one-way door: adding adapters later
+  is fine, but deciding *now* which wire formats `sl` owns
+  keeps the adapter layer from sprawling.
+- The "one config, three adapters" pattern needs to be
+  agreed before any code is written, or we'll refactor it
+  twice.
+
+**Next action:** resolve unknowns 1, 3, and 4 (provider
+list, output-cap default, thinking-budget default + override
+mechanism) before touching `LlmConfig`.
+
+---
